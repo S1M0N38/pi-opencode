@@ -1,6 +1,9 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { AnthropicOptions, Context, Usage } from "@mariozechner/pi-ai";
-import { getModel, streamAnthropic } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Context, Usage } from "@earendil-works/pi-ai";
+import type { AnthropicOptions } from "@earendil-works/pi-ai/api/anthropic-messages";
+import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
+import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
+import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import type { FetchApi, OpenCodeGoUsageWindow } from "../src/index.ts";
 import { updateConfig, type Config } from "../src/config-store.ts";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -1210,14 +1213,14 @@ const zeroUsage: Usage = {
 };
 
 async function serializeAnthropicTurn(history: Context): Promise<unknown> {
-	const model = getModel("opencode-go", "minimax-m2.7");
+	const model = getBuiltinModel("opencode-go", "minimax-m3");
 	assert.equal(model.api, "anthropic-messages");
 	const { pi, ctx } = createHarness();
 	Object.assign(ctx, { model });
 	await pi.emit("session_start", { reason: "start" }, ctx);
 	await pi.runCommand("opencode", "use 2", ctx);
 	let outgoing: unknown;
-	await streamAnthropic(model, history, {
+	await streamAnthropic(model, normalizeContext(history), {
 		// Test double: stops before the Anthropic client can be used, so no network call happens.
 		client: { messages: { create: () => { throw new Error("network must not be reached"); } } } as unknown as AnthropicOptions["client"],
 		cacheRetention: "none",
@@ -1231,7 +1234,7 @@ async function serializeAnthropicTurn(history: Context): Promise<unknown> {
 
 test("real Anthropic serialization drops caller-bound reasoning before any network call", async () => {
 	await withTempConfig(async () => {
-		const model = getModel("opencode-go", "minimax-m2.7");
+		const model = getBuiltinModel("opencode-go", "minimax-m3");
 		const history: Context = {
 			messages: [
 				{ role: "user", content: "Finish", timestamp: 0 },
@@ -1272,7 +1275,7 @@ test("real Anthropic serialization drops caller-bound reasoning before any netwo
 
 test("real Anthropic serialization omits an assistant turn emptied by the projection", async () => {
 	await withTempConfig(async () => {
-		const model = getModel("opencode-go", "minimax-m2.7");
+		const model = getBuiltinModel("opencode-go", "minimax-m3");
 		const history: Context = {
 			messages: [
 				{ role: "user", content: "Go", timestamp: 0 },

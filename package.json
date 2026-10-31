@@ -1,5 +1,5 @@
 {
-  "name": "@lnilluv/pi-opencode-go-rotation",
+  "name": "@s1m0n38/pi-opencode",
   "version": "1.5.3",
   "description": "Rotate between multiple OpenCode Go API keys with reactive 429, rate-limit, and watchdog stall detection",
   "type": "module",
@@ -22,10 +22,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lnilluv/pi-opencode-go-rotation.git"
+    "url": "git+https://github.com/S1M0N38/pi-opencode.git"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": ">=0.71.1"
+    "@earendil-works/pi-coding-agent": ">=1.4.0"
   },
   "keywords": [
     "pi-extension",
@@ -36,7 +36,8 @@
   ],
   "license": "MIT",
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "0.71.1",
-    "typescript": "5.9.3"
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "typescript": "7.0.2"
   }
 }

@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	ConfigLoadError,
 	DEFAULT_COOLDOWN_MINUTES,
@@ -382,8 +382,16 @@ function sanitizeReasoningPayload(payload: unknown): unknown {
 
 const lastAppliedRuntimeKeys = new WeakMap<object, string>();
 
-function getRuntimeKeyStore(modelRegistry: { authStorage?: RuntimeKeyStore; runtime?: RuntimeKeyStore }): RuntimeKeyStore {
-	const store = modelRegistry.authStorage ?? modelRegistry.runtime;
+interface RuntimeKeyStoreHost {
+	authStorage?: RuntimeKeyStore;
+	runtime?: RuntimeKeyStore;
+}
+
+// pi >= 1.0 exposes its ModelRuntime as a private field on ModelRegistry.
+// Read it structurally so the runtime key override keeps working on both layouts.
+function getRuntimeKeyStore(modelRegistry: object): RuntimeKeyStore {
+	const host = modelRegistry as RuntimeKeyStoreHost;
+	const store = host.authStorage ?? host.runtime;
 	if (!store) throw new Error("Model registry does not expose runtime API key storage");
 	return store;
 }
@@ -393,7 +401,7 @@ function ignoreAsyncRefresh(result: void | Promise<void>): void {
 }
 
 /** Set the active key as runtime override (highest priority in auth chain). */
-function applyActiveKey(config: Config, modelRegistry: { authStorage?: RuntimeKeyStore; runtime?: RuntimeKeyStore }, now = Date.now()): string | undefined {
+function applyActiveKey(config: Config, modelRegistry: object, now = Date.now()): string | undefined {
 	const idx = pickAvailableKeyIndex(config, now);
 	if (idx === undefined) return undefined;
 	if (config.activeKeyIndex !== idx) config.activeKeyIndex = idx;

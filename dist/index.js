@@ -258,8 +258,11 @@ function sanitizeReasoningPayload(payload) {
     return request;
 }
 const lastAppliedRuntimeKeys = new WeakMap();
+// pi >= 1.0 exposes its ModelRuntime as a private field on ModelRegistry.
+// Read it structurally so the runtime key override keeps working on both layouts.
 function getRuntimeKeyStore(modelRegistry) {
-    const store = modelRegistry.authStorage ?? modelRegistry.runtime;
+    const host = modelRegistry;
+    const store = host.authStorage ?? host.runtime;
     if (!store)
         throw new Error("Model registry does not expose runtime API key storage");
     return store;
