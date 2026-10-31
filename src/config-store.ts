@@ -35,8 +35,10 @@ export interface Config {
 	cooldownMinutes: number;
 	watchdogEnabled: boolean;
 	watchdogIdleMs: number;
-	/** Key index → epoch ms when cooldown started */
-	cooldowns: Record<number, number>;
+	/** Mirror the active key into pi's auth.json for callers that run with --no-extensions. */
+	syncAuthFile: boolean;
+	/** Key index → epoch ms until which the key is benched after a transient limit */
+	cooldownUntil: Record<number, number>;
 	quotaBlockedUntil: Record<number, number>;
 }
 
@@ -57,7 +59,8 @@ export function createEmptyConfig(): Config {
 		cooldownMinutes: DEFAULT_COOLDOWN_MINUTES,
 		watchdogEnabled: true,
 		watchdogIdleMs: DEFAULT_WATCHDOG_IDLE_MS,
-		cooldowns: {},
+		syncAuthFile: true,
+		cooldownUntil: {},
 		quotaBlockedUntil: {},
 	};
 }
@@ -110,6 +113,9 @@ function parseConfig(value: unknown, path: string): Config {
 	const watchdogEnabled = value.watchdogEnabled ?? true;
 	if (typeof watchdogEnabled !== "boolean") throw new ConfigLoadError(path, "watchdogEnabled is invalid");
 
+	const syncAuthFile = value.syncAuthFile ?? true;
+	if (typeof syncAuthFile !== "boolean") throw new ConfigLoadError(path, "syncAuthFile is invalid");
+
 	const watchdogIdleMsValue = value.watchdogIdleMs;
 	const watchdogIdleMs = watchdogIdleMsValue === undefined ? DEFAULT_WATCHDOG_IDLE_MS : watchdogIdleMsValue;
 	if (typeof watchdogIdleMs !== "number" || !Number.isFinite(watchdogIdleMs) || watchdogIdleMs < 1) {
@@ -122,7 +128,8 @@ function parseConfig(value: unknown, path: string): Config {
 		cooldownMinutes,
 		watchdogEnabled,
 		watchdogIdleMs,
-		cooldowns: parseNumberRecord(value.cooldowns, "cooldowns", path),
+		syncAuthFile,
+		cooldownUntil: parseNumberRecord(value.cooldownUntil, "cooldownUntil", path),
 		quotaBlockedUntil: parseNumberRecord(value.quotaBlockedUntil, "quotaBlockedUntil", path),
 	};
 }

@@ -1,4 +1,6 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { Component, TUI } from "@earendil-works/pi-tui";
 import {
 	ConfigLoadError,
 	DEFAULT_COOLDOWN_MINUTES,
@@ -8,11 +10,15 @@ import {
 	updateConfig,
 	type Config,
 } from "./config-store.ts";
+import { clearAuthKey, syncAuthKey } from "./auth-sync.ts";
 
 const PROVIDER = "opencode-go";
 const PROVIDER_ENV_VAR = "OPENCODE_API_KEY";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const OPENCODE_GO_USAGE_TIMEOUT_MS = 10_000;
+const RANKING_TTL_MS = 15 * 60_000;
+const MONTHLY_WINDOW_NAME_RE = /^month/i;
+const ROLLING_WINDOW_NAME_RE = /^(rolling|5[-\s]?hour|hourly)/i;
 const FIXED_WINDOW_QUOTA_RE = /\b(?:5[- ]hour|weekly|monthly)\b[\s\S]*\b(?:usage\s+)?(?:quota|limit)\b|\b(?:usage|plan)\s+allocated\s+quota\s+exceeded\b|\b(?:quota|limit)\b[\s\S]*\b(?:will\s+reset|resets?\s+at|fixed[- ]window)\b/i;
 const TRANSIENT_RATE_LIMIT_RE = /\b429\b|rate.?limit|too many requests|quota|usage limit|limit reached/i;
 
@@ -42,9 +48,22 @@ export interface TimerApi {
 	clearTimeout(timer: unknown): void;
 }
 
-interface RotateOptions {
-	now?: number;
+export interface KeyUsageSummary {
+	/** Epoch ms at which the monthly (plan) window resets, when the usage call reported one. */
+	readonly monthlyResetAt?: number;
+	readonly monthlyPercent?: number;
+	/** Epoch ms at which the short rolling window frees up again, used to size a transient bench. */
+	readonly rollingResetAt?: number;
 }
+
+/** Key index → what the last usage reading said about its windows. Session memory only. */
+export type KeyRanking = ReadonlyMap<number, KeyUsageSummary>;
+
+const EMPTY_RANKING: KeyRanking = new Map();
+
+type KeyBench =
+	| { readonly kind: "cooldown"; readonly until?: number }
+	| { readonly kind: "quota"; readonly blockedUntil: number; readonly authoritative: boolean };
 
 
 export type ProviderActivityPhase = "waiting-for-response" | "waiting-for-stream" | "streaming";
@@ -261,31 +280,83 @@ function getQuotaBlockedTargets(config: Config, now: number, skipKeyIndex?: numb
 	return targets;
 }
 
-function pickAvailableKeyIndex(config: Config, now = Date.now()): number | undefined {
-	const cdMs = getCooldownMs(config);
-	for (let i = 0; i < config.keys.length; i++) {
-		const idx = (config.activeKeyIndex + i) % config.keys.length;
-		if (getQuotaBlockedUntil(config, idx, now) !== undefined) continue;
-		const cooldownStart = config.cooldowns[idx];
-		if (cooldownStart === undefined || now - cooldownStart >= cdMs) return idx;
+function getCooldownUntil(config: Config, keyIndex: number, now: number): number | undefined {
+	const until = config.cooldownUntil[keyIndex];
+	return typeof until === "number" && Number.isFinite(until) && until > now ? until : undefined;
+}
+
+/** A key can serve traffic only while it carries no quota block and no transient bench. */
+function isKeyEligible(config: Config, keyIndex: number, now: number): boolean {
+	if (config.keys[keyIndex] === undefined) return false;
+	if (getQuotaBlockedUntil(config, keyIndex, now) !== undefined) return false;
+	return getCooldownUntil(config, keyIndex, now) === undefined;
+}
+
+/**
+ * Ordering rule of the whole extension: spend the quota that expires first. Keys with a known
+ * monthly reset rank by that deadline, then by the percentage already burned (a same-day pair
+ * should drain the fuller one first), then by index so the order is deterministic. A key whose
+ * expiry could not be read ranks last: never promote a deadline we do not know.
+ */
+export function rankKeyIndices(config: Config, ranking: KeyRanking): number[] {
+	return config.keys.map((_, index) => index).sort((a, b) => {
+		const left = ranking.get(a);
+		const right = ranking.get(b);
+		const leftReset = left?.monthlyResetAt ?? Number.POSITIVE_INFINITY;
+		const rightReset = right?.monthlyResetAt ?? Number.POSITIVE_INFINITY;
+		if (leftReset !== rightReset) return leftReset < rightReset ? -1 : 1;
+		const leftPercent = left?.monthlyPercent ?? -1;
+		const rightPercent = right?.monthlyPercent ?? -1;
+		if (leftPercent !== rightPercent) return rightPercent - leftPercent;
+		// Last resort: stay on the key this installation last picked, so an unreadable ranking
+		// never silently reverts the selection to key #1 at every start.
+		if (a !== b && a === config.activeKeyIndex) return -1;
+		if (a !== b && b === config.activeKeyIndex) return 1;
+		return a - b;
+	});
+}
+
+function firstEligibleRankedKey(config: Config, ranking: KeyRanking, now: number, excludeKeyIndex?: number): number | undefined {
+	for (const index of rankKeyIndices(config, ranking)) {
+		if (index === excludeKeyIndex) continue;
+		if (isKeyEligible(config, index, now)) return index;
 	}
 	return undefined;
 }
 
-function rotateToNextKey(config: Config, options: RotateOptions = {}): number | undefined {
-	if (config.keys.length === 0) return undefined;
-	const now = options.now ?? Date.now();
-	config.cooldowns[config.activeKeyIndex] = now;
-	const next = pickAvailableKeyIndex(config, now);
-	if (next !== undefined) {
-		config.activeKeyIndex = next;
-		return next;
+/** The key a request should use: a session pin wins, otherwise the best-ranked eligible key. */
+function selectPreferredKeyIndex(config: Config, ranking: KeyRanking, now: number, pinnedKeyIndex?: number): number | undefined {
+	if (pinnedKeyIndex !== undefined && isKeyEligible(config, pinnedKeyIndex, now)) return pinnedKeyIndex;
+	return firstEligibleRankedKey(config, ranking, now);
+}
+
+function benchKey(config: Config, keyIndex: number, bench: KeyBench, now: number): void {
+	if (bench.kind === "quota") {
+		if (bench.authoritative) config.quotaBlockedUntil[keyIndex] = bench.blockedUntil;
+		else setQuotaBlock(config, keyIndex, bench.blockedUntil, now);
+		return;
 	}
-	for (let offset = 1; offset <= config.keys.length; offset++) {
-		const candidate = (config.activeKeyIndex + offset) % config.keys.length;
+	const until = bench.until !== undefined && bench.until > now ? bench.until : now + getCooldownMs(config);
+	config.cooldownUntil[keyIndex] = Math.max(getCooldownUntil(config, keyIndex, now) ?? 0, until);
+}
+
+/**
+ * Bench the key that just failed, then take the best eligible replacement. When every key is
+ * benched, a transient cooldown is cleared rather than keeping a key that is known to be
+ * exhausted active -- but a quota block is never cleared automatically.
+ */
+function benchAndSelectNextKey(config: Config, ranking: KeyRanking, failedKeyIndex: number, bench: KeyBench, now: number): number | undefined {
+	benchKey(config, failedKeyIndex, bench, now);
+	const eligible = firstEligibleRankedKey(config, ranking, now, failedKeyIndex);
+	if (eligible !== undefined) {
+		config.activeKeyIndex = eligible;
+		return eligible;
+	}
+	for (const candidate of rankKeyIndices(config, ranking)) {
+		if (candidate === failedKeyIndex) continue;
 		if (getQuotaBlockedUntil(config, candidate, now) !== undefined) continue;
+		delete config.cooldownUntil[candidate];
 		config.activeKeyIndex = candidate;
-		delete config.cooldowns[candidate];
 		return candidate;
 	}
 	return undefined;
@@ -403,9 +474,15 @@ function ignoreAsyncRefresh(result: void | Promise<void>): void {
 	void result?.catch(() => {});
 }
 
-/** Set the active key as runtime override (highest priority in auth chain). */
-function applyActiveKey(config: Config, modelRegistry: object, now = Date.now()): string | undefined {
-	const idx = pickAvailableKeyIndex(config, now);
+/** Set the best-ranked key as runtime override (highest priority in auth chain). */
+function applyActiveKey(
+	config: Config,
+	modelRegistry: object,
+	now = Date.now(),
+	ranking: KeyRanking = EMPTY_RANKING,
+	pinnedKeyIndex?: number,
+): string | undefined {
+	const idx = selectPreferredKeyIndex(config, ranking, now, pinnedKeyIndex);
 	if (idx === undefined) return undefined;
 	if (config.activeKeyIndex !== idx) config.activeKeyIndex = idx;
 	const key = config.keys[idx].key;
@@ -426,7 +503,7 @@ function applyActiveKey(config: Config, modelRegistry: object, now = Date.now())
 function seedProviderEnv(config: Config, now = Date.now()): void {
 	if (process.env[PROVIDER_ENV_VAR]) return;
 	if (config.keys.length === 0) return;
-	const index = pickAvailableKeyIndex(config, now) ?? config.activeKeyIndex;
+	const index = selectPreferredKeyIndex(config, EMPTY_RANKING, now) ?? config.activeKeyIndex;
 	const key = config.keys[index]?.key;
 	if (!key) return;
 	process.env[PROVIDER_ENV_VAR] = key;
@@ -458,7 +535,7 @@ function getActiveUsageTarget(config: Config): UsageLookupTarget | undefined {
 
 interface SelectionSnapshot extends UsageLookupTarget {
 	readonly blockedUntil: number | undefined;
-	readonly cooldownStart: number | undefined;
+	readonly cooldownUntil: number | undefined;
 }
 
 interface RotationOperation {
@@ -467,9 +544,7 @@ interface RotationOperation {
 	readonly selection: SelectionSnapshot;
 }
 
-type RotationMode =
-	| { readonly kind: "cooldown" }
-	| { readonly kind: "quota"; readonly blockedUntil: number; readonly authoritative: boolean };
+type RotationMode = KeyBench;
 
 type RotationOutcome =
 	| { readonly kind: "rotated"; readonly keyIndex: number; readonly completion: RotationOperation }
@@ -487,7 +562,7 @@ function captureSelectionSnapshot(config: Config, currentTime: number, keyIndex:
 	return {
 		...target,
 		blockedUntil: getQuotaBlockedUntil(config, target.keyIndex, currentTime),
-		cooldownStart: config.cooldowns[target.keyIndex],
+		cooldownUntil: config.cooldownUntil[target.keyIndex],
 	};
 }
 
@@ -502,7 +577,7 @@ function matchesSelectionSnapshot(config: Config, snapshot: SelectionSnapshot, c
 	if ((entry.name || `key-${snapshot.keyIndex + 1}`) !== snapshot.keyName) return false;
 	if (entry.key !== snapshot.bearerToken) return false;
 	if (getQuotaBlockedUntil(config, snapshot.keyIndex, currentTime) !== snapshot.blockedUntil) return false;
-	return config.cooldowns[snapshot.keyIndex] === snapshot.cooldownStart;
+	return config.cooldownUntil[snapshot.keyIndex] === snapshot.cooldownUntil;
 }
 
 function captureRotationOperation(config: Config, currentTime: number, keyIndex: number, epoch: number): RotationOperation | undefined {
@@ -582,6 +657,44 @@ export function parseOpenCodeGoUsage(value: unknown): OpenCodeGoUsageResponse | 
 		windows.push(parsed.name === undefined ? { ...parsed, name } : parsed);
 	}
 	return { windows };
+}
+
+function getWindowResetAt(window: OpenCodeGoUsageWindow, now: number): number | undefined {
+	if (window.resetAt !== undefined) {
+		const parsed = Date.parse(window.resetAt);
+		if (Number.isFinite(parsed) && parsed > now) return parsed;
+	}
+	if (window.resetInSec !== undefined && Number.isFinite(window.resetInSec) && window.resetInSec > 0) {
+		return now + window.resetInSec * 1000;
+	}
+	return undefined;
+}
+
+/** Reduce a usage response to the two deadlines the selection rule cares about. */
+export function summarizeUsage(usage: OpenCodeGoUsageResponse, now: number): KeyUsageSummary {
+	let monthly: OpenCodeGoUsageWindow | undefined;
+	let rolling: OpenCodeGoUsageWindow | undefined;
+	for (const window of usage.windows) {
+		if (monthly === undefined && window.name !== undefined && MONTHLY_WINDOW_NAME_RE.test(window.name)) monthly = window;
+		else if (rolling === undefined && window.name !== undefined && ROLLING_WINDOW_NAME_RE.test(window.name)) rolling = window;
+	}
+	const monthlyResetAt = monthly ? getWindowResetAt(monthly, now) : undefined;
+	const rollingResetAt = rolling ? getWindowResetAt(rolling, now) : undefined;
+	return {
+		...(monthlyResetAt === undefined ? {} : { monthlyResetAt }),
+		...(monthly?.usagePercent === undefined ? {} : { monthlyPercent: monthly.usagePercent }),
+		...(rollingResetAt === undefined ? {} : { rollingResetAt }),
+	};
+}
+
+/** When the short window reopens, which is how long a rate-limited key is really unusable. */
+function getRollingResetUntil(usage: OpenCodeGoUsageResponse, now: number): number | undefined {
+	for (const window of usage.windows) {
+		if (window.name === undefined || !ROLLING_WINDOW_NAME_RE.test(window.name)) continue;
+		const reset = getWindowResetAt(window, now);
+		if (reset !== undefined) return reset;
+	}
+	return undefined;
 }
 
 async function fetchOpenCodeGoUsage(target: UsageLookupTarget | undefined, fetchApi: FetchApi, timers?: TimerApi): Promise<UsageFetchResult> {
@@ -706,26 +819,6 @@ function setQuotaBlock(config: Config, keyIndex: number, blockedUntil: number, n
 	);
 }
 
-function blockQuotaAndSelectNext(config: Config, keyIndex: number, blockedUntil: number, now: number, isAuthoritative = false): number | undefined {
-	if (isAuthoritative) {
-		config.quotaBlockedUntil[keyIndex] = blockedUntil;
-	} else {
-		setQuotaBlock(config, keyIndex, blockedUntil, now);
-	}
-	let next = pickAvailableKeyIndex(config, now);
-	if (next === undefined) {
-		for (let offset = 1; offset <= config.keys.length; offset++) {
-			const candidate = (keyIndex + offset) % config.keys.length;
-			if (getQuotaBlockedUntil(config, candidate, now) !== undefined) continue;
-			next = candidate;
-			delete config.cooldowns[candidate];
-			break;
-		}
-	}
-	if (next !== undefined) config.activeKeyIndex = next;
-	return next;
-}
-
 function reindexAfterRemoval(record: Record<number, number>, removedIndex: number): Record<number, number> {
 	const shifted: Record<number, number> = {};
 	for (const [key, value] of Object.entries(record)) {
@@ -774,25 +867,152 @@ export function formatUsageStatus(result: UsageFetchResult): string {
 	return [`OpenCode usage for ${result.keyName}:`, ...result.usage.windows.map(formatUsageWindow)].join("\n");
 }
 
-function formatStatus(config: Config, now = Date.now()): string {
+export interface FooterUsage {
+	readonly input: number;
+	readonly output: number;
+	readonly cacheRead: number;
+	readonly cacheWrite: number;
+	readonly cost: number;
+	/** Cache hit rate of the latest assistant message, in percent. */
+	readonly cacheHitRate?: number;
+	/** The provider bills a subscription rather than per token. */
+	readonly subscription: boolean;
+}
+
+export interface FooterSnapshot {
+	readonly cwd: string;
+	readonly home?: string;
+	readonly branch: string | null;
+	readonly sessionName?: string;
+	/** Name of the key requests currently go out with. */
+	readonly keyName?: string;
+	readonly usage: FooterUsage;
+	readonly context?: { readonly percent: number | null; readonly contextWindow: number };
+	/** Suffix the built-in footer adds when auto-compaction is on. */
+	readonly autoCompact?: boolean;
+	readonly modelId?: string;
+	readonly provider?: string;
+	/** Number of providers with available models; the provider prefix only appears above one. */
+	readonly providerCount?: number;
+	readonly thinkingLevel?: string;
+	readonly extensionStatuses: ReadonlyMap<string, string>;
+}
+
+const FOOTER_STATUS_KEY = "opencode";
+
+function formatFooterCwd(cwd: string, home: string | undefined): string {
+	if (!home) return cwd;
+	const prefix = home.endsWith("/") ? home : `${home}/`;
+	if (cwd === home) return "~";
+	return cwd.startsWith(prefix) ? `~/${cwd.slice(prefix.length)}` : cwd;
+}
+
+function formatFooterTokens(count: number): string {
+	if (count < 1_000) return `${count}`;
+	if (count < 10_000) return `${(count / 1_000).toFixed(1)}k`;
+	if (count < 1_000_000) return `${Math.round(count / 1_000)}k`;
+	return `${Math.round(count / 1_000_000)}M`;
+}
+
+/** Place `right` flush against the terminal edge, truncating the left side when they collide. */
+function composeFooterLine(left: string, right: string, width: number): string {
+	if (right === "") return truncateToWidth(left, width, "…");
+	const rightWidth = visibleWidth(right);
+	const leftBudget = width - rightWidth - 1;
+	if (leftBudget <= 0) return truncateToWidth(right, width);
+	const leftText = truncateToWidth(left, leftBudget, "…");
+	const pad = " ".repeat(Math.max(1, width - visibleWidth(leftText) - rightWidth));
+	return truncateToWidth(leftText + pad + right, width);
+}
+
+/**
+ * The footer Pi would render, plus the active key right-aligned on the folder line.
+ * Kept as a pure function so the layout is testable without a terminal.
+ */
+export function renderFooterLines(snapshot: FooterSnapshot, theme: Theme, width: number): string[] {
+	const location = [
+		formatFooterCwd(snapshot.cwd, snapshot.home),
+		snapshot.branch === null ? "" : ` (${snapshot.branch})`,
+		snapshot.sessionName === undefined ? "" : ` • ${snapshot.sessionName}`,
+	].join("");
+	// Plain dim text, like the rest of the status bar: the name alone, no prefix, no highlight.
+	const keyLabel = snapshot.keyName === undefined ? "" : theme.fg("dim", snapshot.keyName);
+
+	// Same tokens, same order as Pi's built-in footer.
+	const stats: string[] = [];
+	const usage = snapshot.usage;
+	const experimental = process.env.PI_EXPERIMENTAL === "1";
+	if (usage.input > 0) stats.push(`↑${formatFooterTokens(usage.input)}`);
+	if (usage.output > 0) stats.push(`↓${formatFooterTokens(usage.output)}`);
+	if (usage.cacheRead > 0) stats.push(`R${formatFooterTokens(usage.cacheRead)}`);
+	if (usage.cacheWrite > 0) stats.push(`W${formatFooterTokens(usage.cacheWrite)}`);
+	if ((usage.cacheRead > 0 || usage.cacheWrite > 0) && usage.cacheHitRate !== undefined) {
+		stats.push(`CH${usage.cacheHitRate.toFixed(1)}%`);
+	}
+	if (usage.cost > 0 || usage.subscription) stats.push(`$${usage.cost.toFixed(3)}${usage.subscription ? " (sub)" : ""}`);
+	const contextUsage = snapshot.context;
+	if (contextUsage !== undefined) {
+		const window = formatFooterTokens(contextUsage.contextWindow);
+		const auto = snapshot.autoCompact === false ? "" : " (auto)";
+		const text = contextUsage.percent === null ? `?/${window}${auto}` : `${contextUsage.percent.toFixed(1)}%/${window}${auto}`;
+		const severity = contextUsage.percent ?? 0;
+		stats.push(severity > 90 ? theme.fg("error", text) : severity > 70 ? theme.fg("warning", text) : text);
+	}
+	if (experimental) stats.push(`${theme.fg("dim", "•")} ${theme.bold(theme.fg("warning", "xp"))}`);
+	const thinking = snapshot.thinkingLevel === undefined
+		? ""
+		: snapshot.thinkingLevel === "off" ? " • thinking off" : ` • ${snapshot.thinkingLevel}`;
+	const modelName = snapshot.modelId === undefined ? "" : `${snapshot.modelId}${thinking}`;
+	const modelLabel = modelName === "" || snapshot.provider === undefined || (snapshot.providerCount ?? 0) <= 1
+		? modelName
+		: `(${snapshot.provider}) ${modelName}`;
+
+	const lines = [
+		composeFooterLine(theme.fg("dim", location), keyLabel, width),
+		composeFooterLine(theme.fg("dim", stats.join(" ")), theme.fg("dim", modelLabel), width),
+	];
+	const otherStatuses = [...snapshot.extensionStatuses.entries()]
+		.filter(([key]) => key !== FOOTER_STATUS_KEY)
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([, text]) => text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
+		.filter((text) => text.length > 0)
+		.join(" ");
+	if (otherStatuses.length > 0) lines.push(truncateToWidth(otherStatuses, width));
+	return lines;
+}
+
+function formatStatus(config: Config, ranking: KeyRanking, pinnedKeyIndex: number | undefined, now = Date.now()): string {
 	const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
 	if (config.keys.length === 0) {
 		return `No keys configured. Use /opencode add <name> <key>.\n${watchdogStatus}`;
 	}
-	const cdMs = getCooldownMs(config);
-	return `${config.keys.map((key, i) => {
-		const marker = i === config.activeKeyIndex ? "→" : " ";
-		const cooldownStart = config.cooldowns[i];
-		let tag = "";
-		const quotaReset = getQuotaBlockedUntil(config, i, now);
-		if (quotaReset !== undefined) {
-			tag = ` [quota-blocked ${formatResetIn(Math.ceil((quotaReset - now) / 1000))}]`;
-		} else if (cooldownStart !== undefined) {
-			const remaining = cdMs - (now - cooldownStart);
-			if (remaining > 0) tag = ` [cooldown ${Math.ceil(remaining / 60_000)}m]`;
+	const ranked = rankKeyIndices(config, ranking);
+	const preferred = selectPreferredKeyIndex(config, ranking, now, pinnedKeyIndex);
+	const lines = ranked.map((keyIndex, position) => {
+		const key = config.keys[keyIndex];
+		const summary = ranking.get(keyIndex);
+		const roles: string[] = [];
+		if (pinnedKeyIndex === keyIndex) roles.push("pinned");
+		else if (preferred === keyIndex) roles.push("primary");
+		else roles.push("fallback");
+		const quotaReset = getQuotaBlockedUntil(config, keyIndex, now);
+		if (quotaReset !== undefined) roles.push(`quota-blocked ${formatResetIn(Math.ceil((quotaReset - now) / 1000))}`);
+		else {
+			const cooldownUntil = getCooldownUntil(config, keyIndex, now);
+			if (cooldownUntil !== undefined) roles.push(`cooling ${formatResetIn(Math.ceil((cooldownUntil - now) / 1000))}`);
 		}
-		return `${marker} ${i + 1}. ${key.name}${tag}`;
-	}).join("\n")}\n${watchdogStatus}`;
+		const expiry = summary?.monthlyResetAt === undefined
+			? "monthly expiry unknown"
+			: `monthly ${summary.monthlyPercent === undefined ? "?" : `${Math.round(summary.monthlyPercent)}%`} · resets in ${formatResetIn(Math.ceil((summary.monthlyResetAt - now) / 1000))}`;
+		return `  #${position + 1} ${key.name} (${roles.join(", ")}) ${expiry}`;
+	});
+	const heading = preferred === undefined
+		? "OpenCode keys — every key is blocked until its reset"
+		: `OpenCode keys — primary: ${config.keys[preferred]?.name ?? `key-${preferred + 1}`} (earliest monthly reset first)`;
+	const authLine = config.syncAuthFile
+		? "auth.json mirror: on (active key, for --no-extensions callers)"
+		: "auth.json mirror: off";
+	return `${[heading, ...lines, `Cooldown fallback: ${config.cooldownMinutes || DEFAULT_COOLDOWN_MINUTES} min`, authLine, watchdogStatus].join("\n")}`;
 }
 
 interface WatchdogEvent {
@@ -851,6 +1071,16 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		let watchdogRequestTimedOut = false;
 		let usageDecisionEpoch = 0;
 		let requestRateLimitState: RequestRateLimitState | undefined;
+		let keyRanking: KeyRanking = EMPTY_RANKING;
+		let rankingFetchedAt: number | undefined;
+		let rankingRefresh: Promise<void> | undefined;
+		let expiryWarningShown = false;
+		/** Session-scoped manual pick; `/opencode use|next` sets it, `session_start` clears it. */
+		let pinnedKeyIndex: number | undefined;
+		/** Key name shown in the footer; undefined before a key is applied. */
+		let footerKeyName: string | undefined;
+		let footerTui: TUI | undefined;
+		let authFileNoticeShown = false;
 		const watchdogEvents: WatchdogEvent[] = [];
 
 		const now = (): number => options.clock?.now() ?? Date.now();
@@ -900,24 +1130,207 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 		function applySynchronizedActiveKey(ctx: Pick<ExtensionContext, "modelRegistry">): string | undefined {
 			if (!refreshConfig()) return undefined;
-			const availableIndex = pickAvailableKeyIndex(config, now());
+			const currentTime = now();
+			const availableIndex = selectPreferredKeyIndex(config, keyRanking, currentTime, pinnedKeyIndex);
 			if (availableIndex !== undefined && availableIndex !== config.activeKeyIndex) {
 				const selectedIndex = mutateSharedConfig((freshConfig) => {
-					const freshAvailableIndex = pickAvailableKeyIndex(freshConfig, now());
+					const freshAvailableIndex = selectPreferredKeyIndex(freshConfig, keyRanking, currentTime, pinnedKeyIndex);
 					if (freshAvailableIndex !== undefined) freshConfig.activeKeyIndex = freshAvailableIndex;
 					return freshAvailableIndex;
 				});
 				if (selectedIndex === undefined) return undefined;
 			}
-			return applyActiveKey(config, ctx.modelRegistry, now());
+			return applyKey(ctx, currentTime);
+		}
+
+		/**
+		 * Rank the keys by the expiry the usage endpoint reports. The probe is deliberately never
+		 * on a blocking path: a rate limit or a slow usage call must not delay a turn. A landed
+		 * ranking is applied at the next request boundary, so a key never changes mid-turn.
+		 */
+		async function collectRanking(ctx: Pick<ExtensionContext, "ui">, warn: boolean): Promise<void> {
+			if (!refreshConfig()) return;
+			const probeTime = now();
+			const targets = config.keys
+				.map((_, index) => getUsageTargetForKeyIndex(config, index))
+				.filter((target): target is UsageLookupTarget => target !== undefined);
+			if (targets.length === 0) {
+				keyRanking = EMPTY_RANKING;
+				rankingFetchedAt = probeTime;
+				return;
+			}
+			const results = await Promise.all(targets.map((target) => fetchOpenCodeGoUsage(target, fetchApi, options.timers)));
+			if (!refreshConfig()) return;
+			const next = new Map<number, KeyUsageSummary>();
+			let successful = 0;
+			targets.forEach((target, position) => {
+				const result = results[position];
+				// A key removed or replaced while the probe was in flight must not inherit its reading.
+				if (!matchesUsageTarget(config, target)) return;
+				if (!result.ok) return;
+				successful++;
+				next.set(target.keyIndex, summarizeUsage(result.usage, probeTime));
+			});
+			keyRanking = next;
+			rankingFetchedAt = probeTime;
+			if (warn && successful === 0 && config.keys.length > 1 && !expiryWarningShown) {
+				expiryWarningShown = true;
+				ctx.ui.notify(
+					"OpenCode: could not read key expiry from the usage endpoint; using the configured key order.",
+					"warning",
+				);
+			}
+		}
+
+		function refreshKeyRanking(ctx: Pick<ExtensionContext, "ui">, options: { force?: boolean; warn?: boolean } = {}): Promise<void> {
+			const currentTime = now();
+			const fresh = rankingFetchedAt !== undefined && currentTime - rankingFetchedAt < RANKING_TTL_MS;
+			if (!options.force && fresh) return Promise.resolve();
+			if (rankingRefresh) return rankingRefresh;
+			const run = collectRanking(ctx, options.warn ?? false).finally(() => {
+				rankingRefresh = undefined;
+			});
+			rankingRefresh = run;
+			return run;
 		}
 
 		function invalidateAutomaticDecisions(): void {
 			usageDecisionEpoch++;
 		}
 
-		function beginProviderRequest(ctx: Pick<ExtensionContext, "modelRegistry">): void {
+		/** Keep the footer label in step with the key actually applied. */
+		function updateFooterKey(keyName: string | undefined): void {
+			if (keyName === undefined || keyName === footerKeyName) return;
+			footerKeyName = keyName;
+			footerTui?.requestRender();
+		}
+
+		/** Apply the selected key and refresh the footer instead of printing a startup notice. */
+		function applyKey(ctx: Pick<ExtensionContext, "modelRegistry">, currentTime = now()): string | undefined {
+			const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime, keyRanking, pinnedKeyIndex);
+			updateFooterKey(keyName);
+			if (keyName !== undefined) mirrorActiveKeyInAuthFile();
+			return keyName;
+		}
+
+		/**
+		 * Callers that spawn `pi --no-extensions` (commit-message generators, scripts) load no
+		 * extensions, so the runtime override is invisible to them and the provider looks
+		 * unconfigured. Mirroring the active key into auth.json fixes those without touching the
+		 * rotation this session uses.
+		 */
+		function mirrorActiveKeyInAuthFile(): void {
+			if (!config.syncAuthFile) return;
+			const key = config.keys[config.activeKeyIndex]?.key;
+			if (key === undefined) return;
+			const result = syncAuthKey(PROVIDER, key, config.keys.map((entry) => entry.key));
+			if (result === "kept-foreign" && !authFileNoticeShown) {
+				authFileNoticeShown = true;
+				// Another credential (an OAuth login) owns the entry: leave it alone.
+				return;
+			}
+		}
+
+		function buildFooterSnapshot(
+			ctx: ExtensionContext,
+			footerData: {
+				getGitBranch(): string | null;
+				getExtensionStatuses(): ReadonlyMap<string, string>;
+				getAvailableProviderCount(): number;
+			},
+		): { snapshot: FooterSnapshot; entryCount: number } {
+			let input = 0;
+			let output = 0;
+			let cacheRead = 0;
+			let cacheWrite = 0;
+			let cost = 0;
+			let cacheHitRate: number | undefined;
+			const entries = ctx.sessionManager.getEntries();
+			const addUsage = (usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } }): void => {
+				input += usage.input;
+				output += usage.output;
+				cacheRead += usage.cacheRead;
+				cacheWrite += usage.cacheWrite;
+				cost += usage.cost.total;
+			};
+			for (const entry of entries) {
+				if (entry.type === "usage") {
+					addUsage(entry.usage);
+				} else if (entry.type === "message") {
+					const message = entry.message;
+					if (message.role === "assistant") {
+						addUsage(message.usage);
+						// Same definition as Pi's footer: cache reads over the whole prompt of the turn.
+						const promptTokens = message.usage.input + message.usage.cacheRead + message.usage.cacheWrite;
+						cacheHitRate = promptTokens > 0 ? (message.usage.cacheRead / promptTokens) * 100 : undefined;
+					} else if (message.role === "toolResult" && message.usage !== undefined) {
+						addUsage(message.usage);
+					}
+				} else if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage !== undefined) {
+					addUsage(entry.usage);
+				}
+			}
+			const contextUsage = ctx.getContextUsage();
+			// Optional calls: these are newer than the oldest pi this extension accepts.
+			const settings = typeof pi.getSettings === "function" ? pi.getSettings() : undefined;
+			const model = ctx.model;
+			const provider = model?.provider;
+			const subscription = model !== undefined && provider !== undefined
+				&& ctx.modelRegistry.isUsingOAuth?.(model) === true
+				&& ctx.modelRegistry.getProvider?.(provider)?.auth.oauth?.isSubscription === true;
+			const snapshot: FooterSnapshot = {
+				cwd: ctx.cwd,
+				home: process.env.HOME || process.env.USERPROFILE,
+				branch: footerData.getGitBranch(),
+				sessionName: ctx.sessionManager.getSessionName(),
+				keyName: footerKeyName,
+				usage: { input, output, cacheRead, cacheWrite, cost, cacheHitRate, subscription },
+				context: contextUsage === undefined
+					? undefined
+					: { percent: contextUsage.percent, contextWindow: contextUsage.contextWindow },
+				autoCompact: settings?.compaction?.enabled ?? true,
+				modelId: model?.id,
+				provider,
+				providerCount: footerData.getAvailableProviderCount(),
+				thinkingLevel: model?.reasoning ? (pi.getThinkingLevel?.() ?? "off") : undefined,
+				extensionStatuses: footerData.getExtensionStatuses(),
+			};
+			return { snapshot, entryCount: entries.length };
+		}
+
+		/** Replace the built-in footer so the active key sits on the folder line, right-aligned. */
+		function installFooter(ctx: ExtensionContext): void {
+			if (ctx.mode !== "tui") return;
+			ctx.ui.setFooter((tui, theme, footerData) => {
+				footerTui = tui;
+				const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
+				let cachedWidth: number | undefined;
+				let cachedKey: string | undefined;
+				let cachedEntryCount = -1;
+				let cachedLines: string[] | undefined;
+				const invalidate = (): void => { cachedLines = undefined; };
+				return {
+					dispose: unsubscribe,
+					invalidate,
+					render(width: number): string[] {
+						const { snapshot, entryCount } = buildFooterSnapshot(ctx, footerData);
+						if (cachedLines && cachedWidth === width && cachedKey === footerKeyName && cachedEntryCount === entryCount) {
+							return cachedLines;
+						}
+						cachedWidth = width;
+						cachedKey = footerKeyName;
+						cachedEntryCount = entryCount;
+						cachedLines = renderFooterLines(snapshot, theme, width);
+						return cachedLines;
+					},
+				} satisfies Component & { dispose(): void };
+			});
+		}
+
+		function beginProviderRequest(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">): void {
 			invalidateAutomaticDecisions();
+			// A ranking older than the TTL is refreshed in the background for the next boundary.
+			ignoreAsyncRefresh(refreshKeyRanking(ctx));
 			if (applySynchronizedActiveKey(ctx) === undefined) {
 				requestRateLimitState = undefined;
 				return;
@@ -973,9 +1386,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		}
 
 		function selectNextKey(mode: RotationMode, freshConfig: Config, startIndex: number, currentTime: number): number | undefined {
-			return mode.kind === "quota"
-				? blockQuotaAndSelectNext(freshConfig, startIndex, mode.blockedUntil, currentTime, mode.authoritative)
-				: rotateToNextKey(freshConfig, { now: currentTime });
+			return benchAndSelectNextKey(freshConfig, keyRanking, startIndex, mode, currentTime);
 		}
 
 		/**
@@ -1027,7 +1438,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				if (!recovered.every((snapshot) => matchesSelectionSnapshot(freshConfig, snapshot, currentTime))) return { outcome: "cancelled" };
 				for (const snapshot of recovered) {
 					delete freshConfig.quotaBlockedUntil[snapshot.keyIndex];
-					delete freshConfig.cooldowns[snapshot.keyIndex];
+					delete freshConfig.cooldownUntil[snapshot.keyIndex];
 				}
 				return { outcome: "done", value: selectNextKey(mode, freshConfig, startIndex, currentTime) };
 			});
@@ -1061,7 +1472,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				if (!recovered.every((snapshot) => matchesSelectionSnapshot(freshConfig, snapshot, currentTime))) return { outcome: "cancelled" };
 				for (const snapshot of recovered) {
 					delete freshConfig.quotaBlockedUntil[snapshot.keyIndex];
-					delete freshConfig.cooldowns[snapshot.keyIndex];
+					delete freshConfig.cooldownUntil[snapshot.keyIndex];
 				}
 				return { outcome: "done", value: true };
 			});
@@ -1114,18 +1525,24 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			if (config.keys.length <= 1) return { rotated: false };
 			if (shouldRotateAfterWatchdogTimeout(timeoutInfo, rateLimitAlreadyRotated)) {
 				const previousIndex = config.activeKeyIndex;
-				const nextIndex = mutateSharedConfig((freshConfig) => rotateToNextKey(freshConfig, { now: currentTime }));
-				if (nextIndex === undefined) return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
+				const nextIndex = mutateSharedConfig((freshConfig) => benchAndSelectNextKey(
+					freshConfig,
+					keyRanking,
+					freshConfig.activeKeyIndex,
+					{ kind: "cooldown" },
+					currentTime,
+				));
+				if (nextIndex === undefined) return { keyName: applyKey(ctx, currentTime), rotated: false };
 				const rotated = nextIndex !== previousIndex;
 				if (rotated) invalidateAutomaticDecisions();
-				return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated };
+				return { keyName: applyKey(ctx, currentTime), rotated };
 			}
-			return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
+			return { keyName: applyKey(ctx, currentTime), rotated: false };
 		}
 
 		function startWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui" | "abort">): void {
 			if (!refreshConfig()) return;
-			applyActiveKey(config, ctx.modelRegistry, now());
+			applyKey(ctx);
 			stopWatchdog();
 			resetWatchdogAbortState();
 			clearWatchdogTimeoutGuard();
@@ -1182,7 +1599,16 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			invalidateAutomaticDecisions();
 			requestRateLimitState = undefined;
 			clearWatchdogTimeoutGuard();
+			// A manual pick lasts for the session that made it, never across sessions.
+			pinnedKeyIndex = undefined;
+			expiryWarningShown = false;
 			if (!ensureConfig(ctx)) return;
+			// Decide the session's key from the monthly reset the provider reports. The probe is
+			// started here but never awaited: it lands before the first request in practice, and a
+			// slow or failed usage call must not hold up startup. Nothing is announced: the footer
+			// label follows whichever key ends up applied.
+			ignoreAsyncRefresh(refreshKeyRanking(ctx, { force: true, warn: true }));
+			installFooter(ctx);
 			// A block recorded in an earlier session can be stale: the plan was topped up, or the
 			// window reset before the deadline we stored. Re-check before it decides which key this
 			// session uses, rather than benching a key that is usable again -- or leaving every key
@@ -1190,7 +1616,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			if (config.keys.length > 0) {
 				const currentTime = now();
 				const activeBlocked = getQuotaBlockedUntil(config, config.activeKeyIndex, currentTime) !== undefined;
-				if (activeBlocked || pickAvailableKeyIndex(config, currentTime) === undefined) {
+				if (activeBlocked || selectPreferredKeyIndex(config, keyRanking, currentTime, pinnedKeyIndex) === undefined) {
 					const operation = currentRotationOperation(currentTime);
 					if (!operation) return;
 					const recovery = await recoverQuotaBlocksGuarded(ctx, operation, currentTime);
@@ -1203,8 +1629,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			}
 			// On reload: re-apply active key, skip auto-import
 			if (event.reason === "reload") {
-				const keyName = applySynchronizedActiveKey(ctx);
-				if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
+				applySynchronizedActiveKey(ctx);
 				return;
 			}
 			if (config.keys.length === 0) {
@@ -1219,8 +1644,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					return;
 				}
 			}
-			const keyName = applySynchronizedActiveKey(ctx);
-			if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
+			applySynchronizedActiveKey(ctx);
 		});
 
 		pi.on("before_provider_request", (event, ctx) => {
@@ -1313,7 +1737,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					return;
 				}
 				invalidateAutomaticDecisions();
-				const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime) ?? `key-${outcome.keyIndex + 1}`;
+				const keyName = applyKey(ctx, currentTime) ?? `key-${outcome.keyIndex + 1}`;
 				ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota → rotated to ${keyName}`, "info");
 				return;
 			}
@@ -1331,7 +1755,11 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			const currentTime = now();
 			const operation = currentRotationOperation(currentTime);
 			if (!operation || operation.selection.keyIndex !== requestState.decision.target.keyIndex) return;
-			const outcome = await rotateWithRecovery(ctx, operation, currentTime, { kind: "cooldown" });
+			const cachedRollingReset = keyRanking.get(operation.selection.keyIndex)?.rollingResetAt;
+			const outcome = await rotateWithRecovery(ctx, operation, currentTime, {
+				kind: "cooldown",
+				until: cachedRollingReset !== undefined && cachedRollingReset > currentTime ? cachedRollingReset : undefined,
+			});
 			if (outcome.kind === "cancelled") return;
 			if (outcome.kind === "unavailable") {
 				if (usageDecisionEpoch !== operation.epoch) return;
@@ -1346,7 +1774,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				return;
 			}
 			invalidateAutomaticDecisions();
-			const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
+			const keyName = applyKey(ctx, currentTime);
 			ctx.ui.notify(`OpenCode: Rate-limited → rotated to ${keyName ?? `key-${outcome.keyIndex + 1}`}`, "info");
 		});
 
@@ -1371,6 +1799,10 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			if (!isRotationOperationCurrent(operation, config, usageDecisionEpoch)) return;
 			const currentTime = now();
 			const exhaustedName = config.keys[decision.target.keyIndex]?.name || `key-${decision.target.keyIndex + 1}`;
+			if (usage.ok) {
+				// The response carried a fresh reading: it supersedes whatever the last probe said.
+				keyRanking = new Map(keyRanking).set(decision.target.keyIndex, summarizeUsage(usage.usage, currentTime));
+			}
 			if (usage.ok && hasRateLimitedUsageWindow(usage)) {
 				const outcome = await rotateWithRecovery(ctx, operation, currentTime, {
 					kind: "quota",
@@ -1385,7 +1817,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					return;
 				} else if (outcome.kind === "rotated") {
 					invalidateAutomaticDecisions();
-					const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime) ?? `key-${outcome.keyIndex + 1}`;
+					const keyName = applyKey(ctx, currentTime) ?? `key-${outcome.keyIndex + 1}`;
 					ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota → rotated to ${keyName}`, "info");
 				} else {
 					reportQuotaExhausted(ctx, exhaustedName, currentTime);
@@ -1394,13 +1826,37 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				ctx.ui.notify(formatUsageStatus(usage), "warning");
 				return;
 			}
-			if (event.status === 401) return;
+			if (event.status === 401) {
+				// A rejected credential is a key problem, not a quota problem: hand the session to
+				// the fallback and leave the key unblocked so it can be fixed with `/opencode add`.
+				if (config.keys.length <= 1) {
+					ctx.ui.notify(`OpenCode: ${exhaustedName} was rejected (HTTP 401) and no fallback key is configured.`, "warning");
+					return;
+				}
+				const fallback = firstEligibleRankedKey(config, keyRanking, currentTime, decision.target.keyIndex);
+				if (fallback === undefined) {
+					ctx.ui.notify(`OpenCode: ${exhaustedName} was rejected (HTTP 401); every fallback key is blocked.`, "warning");
+					return;
+				}
+				pinnedKeyIndex = fallback;
+				invalidateAutomaticDecisions();
+				const fallbackName = applyKey(ctx, currentTime)
+					?? `key-${fallback + 1}`;
+				ctx.ui.notify(`OpenCode: ${exhaustedName} was rejected (HTTP 401) → using ${fallbackName}. Replace that key with /opencode add.`, "warning");
+				return;
+			}
 			if (config.keys.length <= 1) {
 				markHandledIfOwned();
 				return;
 			}
 
-			const outcome = await rotateWithRecovery(ctx, operation, currentTime, { kind: "cooldown" });
+			const usageRollingReset = usage.ok ? getRollingResetUntil(usage.usage, currentTime) : undefined;
+			const cachedRollingReset = keyRanking.get(decision.target.keyIndex)?.rollingResetAt;
+			const outcome = await rotateWithRecovery(ctx, operation, currentTime, {
+				kind: "cooldown",
+				until: usageRollingReset
+					?? (cachedRollingReset !== undefined && cachedRollingReset > currentTime ? cachedRollingReset : undefined),
+			});
 			if (outcome.kind === "cancelled") return;
 			if (outcome.kind === "unavailable") {
 				if (usageDecisionEpoch !== operation.epoch) return;
@@ -1424,7 +1880,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			}
 			invalidateAutomaticDecisions();
 			markHandledIfOwned();
-			const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
+			const keyName = applyKey(ctx, currentTime);
 			ctx.ui.notify(`OpenCode: Proactive rate-limit detection (HTTP 429) → rotated to ${keyName ?? `key-${outcome.keyIndex + 1}`}`, "info");
 		});
 
@@ -1440,8 +1896,9 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					case "status":
 					case "list":
 					case "ls": {
-						const status = formatStatus(config, now());
-						ctx.ui.notify(status, "info");
+						await refreshKeyRanking(ctx, { warn: true });
+						if (!refreshConfig()) return;
+						ctx.ui.notify(formatStatus(config, keyRanking, pinnedKeyIndex, now()), "info");
 						break;
 					}
 
@@ -1467,7 +1924,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 								return { error: `Invalid index. Use 1-${freshConfig.keys.length}.` };
 							}
 							freshConfig.activeKeyIndex = targetIndex;
-							delete freshConfig.cooldowns[targetIndex];
+							delete freshConfig.cooldownUntil[targetIndex];
 							delete freshConfig.quotaBlockedUntil[targetIndex];
 							return { index: targetIndex };
 						});
@@ -1479,17 +1936,26 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							ctx.ui.notify(result.error, "warning");
 							return;
 						}
-						const keyName = applyActiveKey(config, ctx.modelRegistry, now());
-						ctx.ui.notify(`Switched to ${keyName}`, "info");
+						if ("index" in result && typeof result.index === "number") pinnedKeyIndex = result.index;
+						const keyName = applyKey(ctx);
+						ctx.ui.notify(`Switched to ${keyName} (pinned for this session)`, "info");
 						break;
 					}
 
 					case "next": {
 						invalidateAutomaticDecisions();
+						const currentIndex = config.activeKeyIndex;
+						// `next` stays a plain advance through the configured list: predictable, and the
+						// pin it sets is what actually overrides the expiry ranking.
+						const nextIndex = config.keys.length === 0 ? undefined : (currentIndex + 1) % config.keys.length;
+						if (nextIndex === undefined) {
+							ctx.ui.notify("No keys configured. Use /opencode add <name> <key>.", "warning");
+							return;
+						}
 						const result = mutateSharedConfig((freshConfig) => {
 							if (freshConfig.keys.length === 0) return { error: "No keys configured. Use /opencode add <name> <key>." };
-							freshConfig.activeKeyIndex = (freshConfig.activeKeyIndex + 1) % freshConfig.keys.length;
-							delete freshConfig.cooldowns[freshConfig.activeKeyIndex];
+							freshConfig.activeKeyIndex = Math.min(nextIndex, freshConfig.keys.length - 1);
+							delete freshConfig.cooldownUntil[freshConfig.activeKeyIndex];
 							delete freshConfig.quotaBlockedUntil[freshConfig.activeKeyIndex];
 							return { index: freshConfig.activeKeyIndex };
 						});
@@ -1501,8 +1967,9 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							ctx.ui.notify(result.error, "warning");
 							return;
 						}
-						const keyName = applyActiveKey(config, ctx.modelRegistry, now());
-						ctx.ui.notify(`Switched to ${keyName}`, "info");
+						if ("index" in result && typeof result.index === "number") pinnedKeyIndex = result.index;
+						const keyName = applyKey(ctx);
+						ctx.ui.notify(`Switched to ${keyName} (pinned for this session)`, "info");
 						break;
 					}
 
@@ -1523,7 +1990,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
 							return;
 						}
-						if (count === 1) applyActiveKey(config, ctx.modelRegistry, now());
+						if (count === 1) applyKey(ctx);
 						ctx.ui.notify(`Added "${name}" (${count} keys)`, "info");
 						break;
 					}
@@ -1537,10 +2004,12 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 								return { error: `Invalid index. Use 1-${freshConfig.keys.length}.` };
 							}
 							const removed = freshConfig.keys.splice(removeIndex, 1)[0];
-							freshConfig.cooldowns = reindexAfterRemoval(freshConfig.cooldowns, removeIndex);
+							freshConfig.cooldownUntil = reindexAfterRemoval(freshConfig.cooldownUntil, removeIndex);
 							freshConfig.quotaBlockedUntil = reindexAfterRemoval(freshConfig.quotaBlockedUntil, removeIndex);
 							if (freshConfig.activeKeyIndex >= freshConfig.keys.length) freshConfig.activeKeyIndex = 0;
 							else if (removeIndex < freshConfig.activeKeyIndex) freshConfig.activeKeyIndex--;
+							if (pinnedKeyIndex === removeIndex) pinnedKeyIndex = undefined;
+							else if (pinnedKeyIndex !== undefined && removeIndex < pinnedKeyIndex) pinnedKeyIndex--;
 							return { removedName: removed.name, count: freshConfig.keys.length };
 						});
 						if (!result) {
@@ -1551,10 +2020,11 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							ctx.ui.notify(result.error, "warning");
 							return;
 						}
-						if (config.keys.length > 0) applyActiveKey(config, ctx.modelRegistry, now());
+						if (config.keys.length > 0) applyKey(ctx);
 						else {
 							lastAppliedRuntimeKeys.delete(ctx.modelRegistry);
 							clearSeededProviderEnv();
+							clearAuthKey(PROVIDER, []);
 							ignoreAsyncRefresh(getRuntimeKeyStore(ctx.modelRegistry).removeRuntimeApiKey(PROVIDER));
 						}
 						ctx.ui.notify(`Removed "${result.removedName}" (${result.count} left)`, "info");
@@ -1564,7 +2034,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					case "reset": {
 						invalidateAutomaticDecisions();
 						const result = mutateSharedConfig((freshConfig) => {
-							freshConfig.cooldowns = {};
+							freshConfig.cooldownUntil = {};
 							freshConfig.quotaBlockedUntil = {};
 							return true;
 						});
@@ -1572,7 +2042,8 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
 							return;
 						}
-						ctx.ui.notify("All cooldowns and quota blocks cleared", "info");
+						pinnedKeyIndex = undefined;
+						ctx.ui.notify("All cooldowns and quota blocks cleared; key order reset", "info");
 						break;
 					}
 
@@ -1591,6 +2062,27 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							return;
 						}
 						ctx.ui.notify(`Cooldown set to ${minutes} min`, "info");
+						break;
+					}
+
+					case "authfile": {
+						const value = parts[1];
+						if (value !== "on" && value !== "off") {
+							ctx.ui.notify(`auth.json mirror: ${config.syncAuthFile ? "on" : "off"} (usage: /opencode authfile on|off)`, "info");
+							return;
+						}
+						const enabled = value === "on";
+						const result = mutateSharedConfig((freshConfig) => {
+							freshConfig.syncAuthFile = enabled;
+							return true;
+						});
+						if (result !== true) {
+							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+							return;
+						}
+						if (enabled) mirrorActiveKeyInAuthFile();
+						else clearAuthKey(PROVIDER, config.keys.map((entry) => entry.key));
+						ctx.ui.notify(`auth.json mirror ${enabled ? "enabled" : "disabled"}`, "info");
 						break;
 					}
 
@@ -1638,7 +2130,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 					default:
 						ctx.ui.notify(
-							"Usage: /opencode [status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]",
+							"Usage: /opencode [status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|authfile [on|off]|watchdog [status|on|off|<seconds>]]",
 							"info",
 						);
 				}
@@ -1657,8 +2149,12 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			cleanupLifecycleState();
 		});
 
-		pi.on("session_shutdown", () => {
+		pi.on("session_shutdown", (_event, ctx) => {
 			cleanupLifecycleState();
+			// The footer is ours: restore Pi's built-in one when this session goes away.
+			footerTui = undefined;
+			footerKeyName = undefined;
+			if (ctx?.mode === "tui") ctx.ui.setFooter(undefined);
 		});
 	};
 }

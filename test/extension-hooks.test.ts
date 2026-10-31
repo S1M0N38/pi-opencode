@@ -3,12 +3,13 @@ import type { Context, Usage } from "@earendil-works/pi-ai";
 import type { AnthropicOptions } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import type { FetchApi, OpenCodeGoUsageWindow } from "../src/index.ts";
 import { updateConfig, type Config } from "../src/config-store.ts";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createOpencodeGoRotationExtension, parseOpenCodeGoUsage } from "../src/index.ts";
@@ -72,6 +73,14 @@ class FakePi {
 	readonly handlers: Record<string, EventHandler> = {};
 	readonly commands: Record<string, CommandRegistration> = {};
 
+	getSettings(): { compaction?: { enabled?: boolean } } {
+		return { compaction: { enabled: true } };
+	}
+
+	getThinkingLevel(): string {
+		return "off";
+	}
+
 	on(event: string, handler: EventHandler): void {
 		this.handlers[event] = handler;
 	}
@@ -93,7 +102,11 @@ class FakePi {
 	}
 }
 
-interface FakeContextState {
+interface FakeFooterContext {
+	footerFactory?: (tui: unknown, theme: unknown, footerData: unknown) => { render(width: number): string[] };
+}
+
+interface FakeContextState extends FakeFooterContext {
 	readonly runtimeKeys: string[];
 	readonly notifications: string[];
 	aborts: number;
@@ -109,6 +122,10 @@ function createContext(state: FakeContextState, registryShape: "authStorage" | "
 		},
 	};
 	const context = {
+		mode: "tui",
+		cwd: "/Users/simo/Developer/forks/pi-opencode",
+		sessionManager: { getEntries: () => [], getSessionName: () => undefined },
+		getContextUsage: () => undefined,
 		model: { provider: "opencode-go", baseUrl: "https://example.test/opencode" },
 		modelRegistry: {
 			getApiKeyForProvider: async () => undefined,
@@ -117,6 +134,9 @@ function createContext(state: FakeContextState, registryShape: "authStorage" | "
 		ui: {
 			notify: (message: string) => {
 				state.notifications.push(message);
+			},
+			setFooter: (factory: FakeContextState["footerFactory"]) => {
+				state.footerFactory = factory;
 			},
 		},
 		abort: () => {
@@ -138,13 +158,13 @@ function writeConfig(path: string): void {
 		cooldownMinutes: 60,
 		watchdogEnabled: true,
 		watchdogIdleMs: 90_000,
-		cooldowns: {},
+		cooldownUntil: {},
 	}), { mode: 0o600 });
 }
 
 function readConfig(path: string): {
 	activeKeyIndex: number;
-	cooldowns: Record<string, number>;
+	cooldownUntil: Record<string, number>;
 	quotaBlockedUntil?: Record<string, number>;
 	keys: Array<{ name: string; key: string }>;
 } {
@@ -185,6 +205,9 @@ async function withTempConfig(run: (configPath: string) => Promise<void>): Promi
 	const configPath = join(dir, "opencode-keys.json");
 	const previousConfigPath = process.env.PI_OPENCODE_ROTATION_CONFIG;
 	process.env.PI_OPENCODE_ROTATION_CONFIG = configPath;
+	// The extension mirrors the active key into auth.json; keep that inside the temp dir.
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = dir;
 	writeConfig(configPath);
 	try {
 		await run(configPath);
@@ -193,6 +216,11 @@ async function withTempConfig(run: (configPath: string) => Promise<void>): Promi
 			delete process.env.PI_OPENCODE_ROTATION_CONFIG;
 		} else {
 			process.env.PI_OPENCODE_ROTATION_CONFIG = previousConfigPath;
+		}
+		if (previousAgentDir === undefined) {
+			delete process.env.PI_CODING_AGENT_DIR;
+		} else {
+			process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		}
 		rmSync(dir, { recursive: true, force: true });
 		release();
@@ -556,7 +584,7 @@ test("an unmatched 429 response cannot rotate after another provider request sta
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 
 		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
-		assert.deepEqual(readConfig(configPath).cooldowns, {});
+		assert.deepEqual(readConfig(configPath).cooldownUntil, {});
 	});
 });
 
@@ -599,7 +627,7 @@ test("transient all-cooldown fallback skips active quota blocks", async () => {
 		const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
 		writeFileSync(configPath, JSON.stringify({
 			...persisted,
-			cooldowns: { 1: 0, 2: 0 },
+			cooldownUntil: { 1: 3_600_000, 2: 3_600_000 },
 			quotaBlockedUntil: { 1: 3_600_000 },
 		}), { mode: 0o600 });
 		const { pi, ctx, state } = createHarness();
@@ -620,7 +648,7 @@ test("quota exhaustion falls back to a cooling key instead of keeping the blocke
 		const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
 		writeFileSync(configPath, JSON.stringify({
 			...persisted,
-			cooldowns: { 1: 0, 2: 0 },
+			cooldownUntil: { 1: 3_600_000, 2: 3_600_000 },
 		}), { mode: 0o600 });
 		const fetch: FetchApi = async () => ({
 			ok: true,
@@ -635,7 +663,7 @@ test("quota exhaustion falls back to a cooling key instead of keeping the blocke
 
 		assert.equal(state.runtimeKeys.at(-1), "sk-two");
 		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "0": 3_600_000 });
-		assert.deepEqual(readConfig(configPath).cooldowns, { "2": 0 });
+		assert.deepEqual(readConfig(configPath).cooldownUntil, { "2": 3_600_000 });
 	});
 });
 
@@ -894,7 +922,7 @@ for (const usageResponse of [
 	{ ok: false, status: 503, json: async () => ({}) },
 	{ ok: true, status: 200, json: async () => ({ usage: { monthly: { status: "ok", percent: 10 } } }) },
 ]) {
-	test(`http 401 does not rotate without confirmed quota (${usageResponse.status}, ${usageResponse.ok})`, async () => {
+	test(`http 401 without quota evidence hands the session to the fallback (${usageResponse.status}, ${usageResponse.ok})`, async () => {
 		await withTempConfig(async (configPath) => {
 			const { pi, ctx, state } = createHarness("runtime", async () => usageResponse);
 			await pi.emit("session_start", { reason: "start" }, ctx);
@@ -903,9 +931,12 @@ for (const usageResponse of [
 			await pi.emit("message_end", {
 				message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: "401 Unauthorized: authentication limit reached; monthly quota" },
 			}, ctx);
-			assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+			// A rejected credential is not a quota problem: switch to the fallback, block nothing.
+			// The switch is a session pin, so the persisted selection is left alone.
+			assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-two"]);
 			assert.equal(readConfig(configPath).activeKeyIndex, 0);
 			assert.deepEqual(readConfig(configPath).quotaBlockedUntil ?? {}, {});
+			assert.match(state.notifications.join("\n"), /rejected \(HTTP 401\) → using two/);
 		});
 	});
 }
@@ -947,23 +978,23 @@ test("manual use, next, and reset clear their intended quota blocks", async () =
 		const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
 		writeFileSync(configPath, JSON.stringify({
 			...persisted,
-			cooldowns: { 0: 10, 1: 20, 2: 30 },
+			cooldownUntil: { 0: 3_600_010, 1: 3_600_020, 2: 3_600_030 },
 			quotaBlockedUntil: { 0: 3_600_000, 1: 3_600_000, 2: 3_600_000 },
 		}), { mode: 0o600 });
 		const { pi, ctx, state } = createHarness();
 
 		await pi.runCommand("opencode", "use 2", ctx);
 		assert.equal(state.runtimeKeys.at(-1), "sk-two");
-		assert.deepEqual(readConfig(configPath).cooldowns, { "0": 10, "2": 30 });
+		assert.deepEqual(readConfig(configPath).cooldownUntil, { "0": 3_600_010, "2": 3_600_030 });
 		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "0": 3_600_000, "2": 3_600_000 });
 
 		await pi.runCommand("opencode", "next", ctx);
 		assert.equal(state.runtimeKeys.at(-1), "sk-three");
-		assert.deepEqual(readConfig(configPath).cooldowns, { "0": 10 });
+		assert.deepEqual(readConfig(configPath).cooldownUntil, { "0": 3_600_010 });
 		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "0": 3_600_000 });
 
 		await pi.runCommand("opencode", "reset", ctx);
-		assert.deepEqual(readConfig(configPath).cooldowns, {});
+		assert.deepEqual(readConfig(configPath).cooldownUntil, {});
 		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {});
 	});
 });
@@ -973,14 +1004,14 @@ test("removing a key reindexes cooldown and quota maps", async () => {
 		const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
 		writeFileSync(configPath, JSON.stringify({
 			...persisted,
-			cooldowns: { 0: 10, 1: 20, 2: 30 },
+			cooldownUntil: { 0: 10, 1: 20, 2: 30 },
 			quotaBlockedUntil: { 0: 100, 1: 200, 2: 300 },
 		}), { mode: 0o600 });
 		const { pi, ctx } = createHarness();
 
 		await pi.runCommand("opencode", "rm 2", ctx);
 
-		assert.deepEqual(readConfig(configPath).cooldowns, { "0": 10, "1": 30 });
+		assert.deepEqual(readConfig(configPath).cooldownUntil, { "0": 10, "1": 30 });
 		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "0": 100, "1": 300 });
 	});
 });
@@ -999,7 +1030,8 @@ test("status shows key names without exposing key material", async () => {
 		const status = state.notifications.at(-1) ?? "";
 		assert.match(status, /one/);
 		assert.match(status, /two/);
-		assert.match(status, /two \[quota-blocked 2m\]/);
+		assert.match(status, /#1 one \(primary\)/);
+		assert.match(status, /#2 two \(fallback, quota-blocked 2m\)/);
 		assert.doesNotMatch(status, /sk-one|sk-two|sk-three/);
 	});
 });
@@ -1478,7 +1510,7 @@ test("a stale startup recovery cannot override a manual key selection", async ()
 
 const snapshotMutations = [
 	{ name: "quota deadline", mutate: (config: Config) => { config.quotaBlockedUntil[0] = 19_999_999; } },
-	{ name: "cooldown", mutate: (config: Config) => { config.cooldowns[0] = 500_000; } },
+	{ name: "cooldown", mutate: (config: Config) => { config.cooldownUntil[0] = 500_000; } },
 	{ name: "active selection", mutate: (config: Config) => { config.activeKeyIndex = 1; } },
 	{ name: "credential", mutate: (config: Config) => { config.keys[0].key = "sk-replaced"; } },
 ] satisfies Array<{ name: string; mutate: (config: Config) => void }>;
@@ -1584,5 +1616,233 @@ test("a stale uncertain recovery cannot report exhaustion for a superseded decis
 		await pending;
 
 		assert.doesNotMatch(state.notifications.join("\n"), /all other keys are quota-blocked/);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Expiry priority: spend the plan that resets first
+// ---------------------------------------------------------------------------
+
+/** The expiry probe is fire-and-forget; give it the ticks a real startup would have. */
+const settleRanking = (): Promise<void> => new Promise((resolve) => { setTimeout(resolve, 0); });
+
+function usagePerKey(responses: Record<string, OpenCodeGoUsageWindow[]>): FetchApi {
+	return async (_url, init) => {
+		const bearer = init.headers.Authorization ?? "";
+		const windows = responses[bearer.replace(/^Bearer /, "")];
+		return windows === undefined
+			? { ok: false, status: 404, json: async () => ({}) }
+			: usageResponse(windows);
+	};
+}
+
+const monthlyWindow = (resetsAt: string, usagePercent: number): OpenCodeGoUsageWindow =>
+	({ name: "monthly", status: "active", usagePercent, resetAt: resetsAt });
+
+test("the monthly plan that expires first becomes the primary key", async () => {
+	await withTempConfig(async () => {
+		const fetch = usagePerKey({
+			"sk-one": [monthlyWindow("2026-11-30T09:44:52Z", 0)],
+			"sk-two": [monthlyWindow("2026-11-13T13:45:01Z", 44)],
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await settleRanking();
+		await pi.emit("before_provider_request", {}, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+	});
+});
+
+test("the ranking follows the calendar, not the key index, on the next session", async () => {
+	await withTempConfig(async () => {
+		const fetch = usagePerKey({
+			"sk-one": [monthlyWindow("2026-12-13T13:45:01Z", 3)],
+			"sk-two": [monthlyWindow("2026-12-30T09:44:52Z", 44)],
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+	});
+});
+
+test("a key with an unreadable expiry ranks behind a key with a known reset", async () => {
+	await withTempConfig(async () => {
+		const fetch = usagePerKey({ "sk-two": [monthlyWindow("2026-11-13T13:45:01Z", 44)] });
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await settleRanking();
+		await pi.emit("before_provider_request", {}, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+	});
+});
+
+test("a transient 429 benches the key until its rolling window reopens", async () => {
+	await withTempConfig(async (configPath) => {
+		const rollingReset = "2026-10-31T05:09:37Z";
+		const fetch = usagePerKey({
+			"sk-one": [{ name: "rolling", status: "active", usagePercent: 40, resetAt: rollingReset }],
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.equal(readConfig(configPath).cooldownUntil["0"], Date.parse(rollingReset));
+	});
+});
+
+test("a manual pick lasts for the session and the next session re-ranks", async () => {
+	await withTempConfig(async () => {
+		const fetch = usagePerKey({
+			"sk-one": [monthlyWindow("2026-11-13T13:45:01Z", 2)],
+			"sk-two": [monthlyWindow("2026-11-30T09:44:52Z", 44)],
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+
+		await pi.runCommand("opencode", "use 2", ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+
+		await pi.emit("session_start", { reason: "reload" }, ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+	});
+});
+
+test("status names the key with the earliest monthly reset as primary", async () => {
+	await withTempConfig(async () => {
+		const fetch = usagePerKey({
+			"sk-one": [monthlyWindow("2026-11-30T09:44:52Z", 0)],
+			"sk-two": [monthlyWindow("2026-11-13T13:45:01Z", 44)],
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.runCommand("opencode", "status", ctx);
+
+		const status = state.notifications.join("\n");
+		assert.match(status, /primary: two/);
+		assert.match(status, /#1 two \(primary\) monthly 44%/);
+	});
+});
+
+test("the expiry ranking is cached for 15 minutes and re-read after that", async () => {
+	await withTempConfig(async () => {
+		const calls: string[] = [];
+		const windows: Record<string, OpenCodeGoUsageWindow[]> = {
+			"sk-one": [monthlyWindow("2026-11-30T09:44:52Z", 0)],
+			"sk-two": [monthlyWindow("2026-11-13T13:45:01Z", 44)],
+		};
+		const fetch: FetchApi = async (_url, init) => {
+			const key = (init.headers.Authorization ?? "").replace(/^Bearer /, "");
+			calls.push(key);
+			return usageResponse(windows[key] ?? []);
+		};
+		const { pi, ctx, clock } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await settleRanking();
+		assert.deepEqual(calls, ["sk-one", "sk-two", "sk-three"]);
+
+		await pi.emit("before_provider_request", {}, ctx);
+		await settleRanking();
+		assert.equal(calls.length, 3, "a fresh ranking is reused, not re-fetched");
+
+		clock.advance(15 * 60_000 + 1);
+		await pi.emit("before_provider_request", {}, ctx);
+		await settleRanking();
+		assert.equal(calls.length, 6, "a ranking older than the TTL is refreshed");
+	});
+});
+
+test("the footer shows the ranked key on the folder line and prints no startup notice", async () => {
+	await withTempConfig(async () => {
+		const fetch = usagePerKey({
+			"sk-one": [monthlyWindow("2026-11-30T09:44:52Z", 0)],
+			"sk-two": [monthlyWindow("2026-11-13T13:45:01Z", 44)],
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await settleRanking();
+		await pi.emit("before_provider_request", {}, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.doesNotMatch(state.notifications.join("\n"), /Active key/);
+
+		const factory = state.footerFactory;
+		assert.ok(factory, "session_start installs a footer");
+		const theme = { fg: (_color: string, text: string) => text };
+		const footerData = {
+			getGitBranch: () => "main",
+			getExtensionStatuses: () => new Map(),
+			getAvailableProviderCount: () => 1,
+			onBranchChange: () => () => {},
+		};
+		const lines = factory(undefined, theme, footerData).render(70);
+		assert.match(lines[0], /pi-opencode \(main\)/);
+		assert.match(lines[0], / two$/);
+		assert.equal(visibleWidth(lines[0]), 70);
+	});
+});
+
+test("an unreadable ranking keeps the persisted selection instead of key #1", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { activeKeyIndex: 1 });
+		const { pi, ctx, state } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.equal(readConfig(configPath).activeKeyIndex, 1);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// auth.json mirror: `pi --no-extensions` callers (T3 Code commit messages) need it
+// ---------------------------------------------------------------------------
+
+test("the active key is mirrored into auth.json for extensionless callers", async () => {
+	await withTempConfig(async () => {
+		const fetch = usagePerKey({
+			"sk-one": [monthlyWindow("2026-11-30T09:44:52Z", 0)],
+			"sk-two": [monthlyWindow("2026-11-13T13:45:01Z", 44)],
+		});
+		const { pi, ctx } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await settleRanking();
+		await pi.emit("before_provider_request", {}, ctx);
+
+		const auth = JSON.parse(readFileSync(join(dirname(process.env.PI_OPENCODE_ROTATION_CONFIG ?? ""), "auth.json"), "utf-8"));
+		assert.deepEqual(auth["opencode-go"], { type: "api_key", key: "sk-two" });
+	});
+});
+
+test("disabling the mirror clears the entry we wrote", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness();
+		const authPath = join(dirname(process.env.PI_OPENCODE_ROTATION_CONFIG ?? ""), "auth.json");
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		assert.deepEqual(JSON.parse(readFileSync(authPath, "utf-8"))["opencode-go"], { type: "api_key", key: "sk-one" });
+
+		await pi.runCommand("opencode", "authfile off", ctx);
+		assert.deepEqual(JSON.parse(readFileSync(authPath, "utf-8")), {});
+		assert.match(state.notifications.join("\n"), /auth\.json mirror disabled/);
+
+		await pi.runCommand("opencode", "authfile on", ctx);
+		assert.deepEqual(JSON.parse(readFileSync(authPath, "utf-8"))["opencode-go"], { type: "api_key", key: "sk-one" });
 	});
 });
