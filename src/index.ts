@@ -10,6 +10,7 @@ import {
 } from "./config-store.ts";
 
 const PROVIDER = "opencode-go";
+const PROVIDER_ENV_VAR = "OPENCODE_API_KEY";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const OPENCODE_GO_USAGE_TIMEOUT_MS = 10_000;
 const FIXED_WINDOW_QUOTA_RE = /\b(?:5[- ]hour|weekly|monthly)\b[\s\S]*\b(?:usage\s+)?(?:quota|limit)\b|\b(?:usage|plan)\s+allocated\s+quota\s+exceeded\b|\b(?:quota|limit)\b[\s\S]*\b(?:will\s+reset|resets?\s+at|fixed[- ]window)\b/i;
@@ -381,6 +382,8 @@ function sanitizeReasoningPayload(payload: unknown): unknown {
 }
 
 const lastAppliedRuntimeKeys = new WeakMap<object, string>();
+/** Value this extension put in the provider env var, if it seeded it. */
+let seededProviderEnvValue: string | undefined;
 
 interface RuntimeKeyStoreHost {
 	authStorage?: RuntimeKeyStore;
@@ -411,6 +414,32 @@ function applyActiveKey(config: Config, modelRegistry: object, now = Date.now())
 		ignoreAsyncRefresh(getRuntimeKeyStore(modelRegistry).setRuntimeApiKey(PROVIDER, key));
 	}
 	return config.keys[idx].name || `key-${idx + 1}`;
+}
+
+/**
+ * Pi resolves `enabledModels` and the startup model before `session_start`, so the runtime
+ * key applied there arrives too late: `opencode-go` looks unconfigured and its configured
+ * models are filtered out of the scope. Seed the environment credential at load time so
+ * the provider and its models are visible to startup selection and `pi --list-models`.
+ * Requests still use the runtime override, so rotation and quota recovery are unchanged.
+ */
+function seedProviderEnv(config: Config, now = Date.now()): void {
+	if (process.env[PROVIDER_ENV_VAR]) return;
+	if (config.keys.length === 0) return;
+	const index = pickAvailableKeyIndex(config, now) ?? config.activeKeyIndex;
+	const key = config.keys[index]?.key;
+	if (!key) return;
+	process.env[PROVIDER_ENV_VAR] = key;
+	seededProviderEnvValue = key;
+}
+
+/** Clear the seeded credential, but never a value the user set before us. */
+function clearSeededProviderEnv(): void {
+	if (seededProviderEnvValue === undefined) return;
+	if (process.env[PROVIDER_ENV_VAR] === seededProviderEnvValue) {
+		delete process.env[PROVIDER_ENV_VAR];
+	}
+	seededProviderEnvValue = undefined;
 }
 
 function getUsageTargetForKeyIndex(config: Config, keyIndex: number): UsageLookupTarget | undefined {
@@ -826,6 +855,13 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 		const now = (): number => options.clock?.now() ?? Date.now();
 		const fetchApi: FetchApi = options.fetch ?? globalThis.fetch.bind(globalThis);
+
+		// Runs while pi loads extensions, before it resolves the session's model scope.
+		try {
+			seedProviderEnv(loadConfig(), now());
+		} catch {
+			// Invalid configuration is reported on session_start; never break startup.
+		}
 
 		function formatConfigError(error: unknown): string {
 			if (error instanceof ConfigLoadError) return error.message;
@@ -1518,6 +1554,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						if (config.keys.length > 0) applyActiveKey(config, ctx.modelRegistry, now());
 						else {
 							lastAppliedRuntimeKeys.delete(ctx.modelRegistry);
+							clearSeededProviderEnv();
 							ignoreAsyncRefresh(getRuntimeKeyStore(ctx.modelRegistry).removeRuntimeApiKey(PROVIDER));
 						}
 						ctx.ui.notify(`Removed "${result.removedName}" (${result.count} left)`, "info");

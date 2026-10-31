@@ -248,16 +248,52 @@ test("session start supports the current model registry runtime store", async ()
 	});
 });
 
+test("load-time seeding exposes the provider before session_start", async () => {
+	await withTempConfig(async () => {
+		const previous = process.env.OPENCODE_API_KEY;
+		delete process.env.OPENCODE_API_KEY;
+		try {
+			createHarness("runtime");
+			assert.equal(process.env.OPENCODE_API_KEY, "sk-one");
+		} finally {
+			if (previous === undefined) delete process.env.OPENCODE_API_KEY;
+			else process.env.OPENCODE_API_KEY = previous;
+		}
+	});
+});
+
+test("load-time seeding leaves a user-provided key untouched", async () => {
+	await withTempConfig(async () => {
+		const previous = process.env.OPENCODE_API_KEY;
+		process.env.OPENCODE_API_KEY = "sk-external";
+		try {
+			createHarness("runtime");
+			assert.equal(process.env.OPENCODE_API_KEY, "sk-external");
+		} finally {
+			if (previous === undefined) delete process.env.OPENCODE_API_KEY;
+			else process.env.OPENCODE_API_KEY = previous;
+		}
+	});
+});
+
 test("runtime registry supports resume, reload, and final-key removal", async () => {
 	await withTempConfig(async () => {
-		const { pi, ctx, state } = createHarness("runtime");
-		await pi.emit("session_start", { reason: "resume" }, ctx);
-		await pi.emit("session_start", { reason: "reload" }, ctx);
-		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-one"]);
-		await pi.runCommand("opencode", "remove 3", ctx);
-		await pi.runCommand("opencode", "remove 2", ctx);
-		await pi.runCommand("opencode", "remove 1", ctx);
-		assert.equal(state.runtimeKeys.at(-1), "removed");
+		const previous = process.env.OPENCODE_API_KEY;
+		delete process.env.OPENCODE_API_KEY;
+		try {
+			const { pi, ctx, state } = createHarness("runtime");
+			await pi.emit("session_start", { reason: "resume" }, ctx);
+			await pi.emit("session_start", { reason: "reload" }, ctx);
+			assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-one"]);
+			await pi.runCommand("opencode", "remove 3", ctx);
+			await pi.runCommand("opencode", "remove 2", ctx);
+			await pi.runCommand("opencode", "remove 1", ctx);
+			assert.equal(state.runtimeKeys.at(-1), "removed");
+			assert.equal(process.env.OPENCODE_API_KEY, undefined);
+		} finally {
+			if (previous === undefined) delete process.env.OPENCODE_API_KEY;
+			else process.env.OPENCODE_API_KEY = previous;
+		}
 	});
 });
 
