@@ -5,10 +5,7 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": [
-    "dist",
-    "README.md"
-  ],
+  "private": true,
   "pi": {
     "extensions": [
       "./dist/index.js"
@@ -18,7 +15,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "prepack": "npm run build"
+    "check:dist": "npm run build && git diff --exit-code -- dist"
   },
   "repository": {
     "type": "git",

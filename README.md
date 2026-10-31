@@ -4,9 +4,25 @@ Rotate between multiple OpenCode Go API keys. The extension checks OpenCode Go u
 
 ## Install
 
+pi installs this extension straight from git; no npm release is involved.
+
 ```bash
-pi install npm:@s1m0n38/pi-opencode
+pi install git:github.com/S1M0N38/pi-opencode
 ```
+
+That tracks the `main` branch. To stay on a known-good release, pin a tag:
+
+```bash
+pi install git:github.com/S1M0N38/pi-opencode@v1.5.3
+```
+
+A pinned tag does not move. Update an unpinned install with:
+
+```bash
+pi update git:github.com/S1M0N38/pi-opencode
+```
+
+The clone lands in `~/.pi/agent/git/github.com/S1M0N38/pi-opencode`, which is a package, so `pi remove git:github.com/S1M0N38/pi-opencode` uninstalls it.
 
 ## Setup
 
@@ -97,6 +113,24 @@ Set `maxRetries` to at least the number of keys so all keys get a chance before 
 - When all keys are quota-blocked, automatic rotation stops on the current runtime key until a block expires or a manual command clears one.
 - Go plan usage limits are tied to the subscription workspace; multiple keys from one workspace should not be assumed to provide independent quota. See the [OpenCode Go documentation](https://opencode.ai/docs/go/).
 - Keys added via `/opencode add` are stored in plaintext. The config file is created and maintained with `0600` permissions.
+
+## Development
+
+The committed `dist/` is what git installs load, so always commit the build output together with `src/`.
+
+```bash
+npm install
+npm test
+npm run typecheck
+npm run build
+npm run check:dist   # fails if dist/ is out of date
+```
+
+To load a local checkout with your edits instead of the clone in `~/.pi/agent/git`, point pi at the path:
+
+```bash
+pi install ./   # adds the working directory to ~/.pi/agent/settings.json
+```
 
 ## License
 
