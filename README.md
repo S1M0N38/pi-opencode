@@ -116,17 +116,15 @@ Set `maxRetries` to at least the number of keys so all keys get a chance before 
 
 ## Development
 
-The committed `dist/` is what git installs load, so always commit the build output together with `src/`.
+Pi loads `src/index.ts` directly, so there is no build step and no compiled output to keep in sync.
 
 ```bash
 npm install
 npm test
 npm run typecheck
-npm run build
-npm run check:dist   # fails if dist/ is out of date
 ```
 
-To load a local checkout with your edits instead of the clone in `~/.pi/agent/git`, point pi at the path:
+To load your working copy instead of the clone in `~/.pi/agent/git`, point pi at the path:
 
 ```bash
 pi install ./   # adds the working directory to ~/.pi/agent/settings.json

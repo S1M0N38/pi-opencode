@@ -3,19 +3,15 @@
   "version": "1.5.3",
   "description": "Rotate between multiple OpenCode Go API keys with reactive 429, rate-limit, and watchdog stall detection",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
   "private": true,
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./src/index.ts"
     ]
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test test/*.test.ts",
-    "check:dist": "npm run build && git diff --exit-code -- dist"
+    "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "repository": {
     "type": "git",

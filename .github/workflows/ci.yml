@@ -27,8 +27,3 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
-
-      # Git installs load the committed build output without compiling it,
-      # so dist/ must always match src/.
-      - name: Check committed build output
-        run: npm run check:dist
